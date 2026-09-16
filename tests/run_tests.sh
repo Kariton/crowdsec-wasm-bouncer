@@ -164,6 +164,13 @@ assert_status "SQLi with sleep in body" 403 \
     -H "Content-Type: application/x-www-form-urlencoded" \
     -d "id=1;WAITFOR DELAY '0:0:5'--"
 
+# Regression for the AppSec body-truncation bypass: a leading non-ASCII byte must
+# not hide the SQLi payload that follows it from AppSec inspection.
+assert_status "SQLi hidden behind leading non-ASCII byte (bypass regression)" 403 \
+    -X POST "$ENVOY_URL/post" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-binary $'\xC3\xA9username=admin\' OR 1=1--&password=x'
+
 echo ""
 
 # -----------------------------------------------------------

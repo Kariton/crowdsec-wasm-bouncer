@@ -23,6 +23,11 @@ struct Decision {
     scenario: String,
 }
 
+/// Hard cap on the LAPI decisions-stream response body read per sync tick.
+/// Bounds memory against a slow/compromised/misrouted LAPI claiming a huge
+/// body_size, while staying well above realistic blocklist sizes.
+const MAX_LAPI_RESPONSE_BODY_SIZE: usize = 32 * 1024 * 1024;
+
 pub struct CrowdSecPlugin {
     config: Option<Config>,
     first_sync: bool,
@@ -126,6 +131,15 @@ impl Context for CrowdSecPlugin {
             log::error!(
                 "LAPI decision endpoint returned unexpected status: {}",
                 status
+            );
+            return;
+        }
+
+        if body_size > MAX_LAPI_RESPONSE_BODY_SIZE {
+            log::error!(
+                "LAPI decisions response body too large ({} bytes, max {}), skipping sync",
+                body_size,
+                MAX_LAPI_RESPONSE_BODY_SIZE
             );
             return;
         }

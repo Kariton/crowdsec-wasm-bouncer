@@ -68,6 +68,44 @@ fn is_trusted_ip(ip: &str, trusted: &[String]) -> bool {
     trusted.iter().any(|entry| ip_in_cidr(ip, entry))
 }
 
+/// Whether a request body's declared Content-Type is one AppSec can meaningfully
+/// inspect as text. Binary/compressed content types are skipped entirely (headers-only
+/// AppSec check) rather than forwarded, since raw binary noise scores as highly
+/// anomalous under signature-based WAF rules and can trigger false-positive bans on
+/// legitimate uploads.
+fn body_is_inspectable(content_type: &str) -> bool {
+    if content_type.is_empty() {
+        return true;
+    }
+    let ct = content_type.to_lowercase();
+    let media = ct.split(';').next().unwrap_or("").trim();
+    matches!(
+        media,
+        "application/x-www-form-urlencoded"
+            | "application/json"
+            | "application/xml"
+            | "application/soap+xml"
+            | "application/xhtml+xml"
+            | "application/graphql"
+            | "application/csp-report"
+    ) || media.starts_with("text/")
+        || media.starts_with("multipart/")
+        || media.ends_with("+json")
+        || media.ends_with("+xml")
+}
+
+/// Whether on_http_request_body should dispatch the buffered body to AppSec now:
+/// only once per request, when enough data has accumulated or the stream ended,
+/// and never while a call is already in flight.
+fn should_dispatch_appsec(
+    pending: bool,
+    body_len: usize,
+    max_size: usize,
+    end_of_stream: bool,
+) -> bool {
+    !pending && (body_len >= max_size || end_of_stream)
+}
+
 /// AppSec bot-detection challenge envelope: sent with HTTP 403 in place of a classic
 /// ban when the request should instead be served a proof-of-work/fingerprint challenge.
 /// See https://docs.crowdsec.net/docs/next/appsec/bot_detection/challenge_protocol
@@ -109,6 +147,11 @@ fn build_challenge_headers(envelope: &ChallengeEnvelope) -> Vec<(String, String)
     headers
 }
 
+/// Hard cap on the AppSec 403-response body (challenge/ban envelope) read per call.
+/// Bounds memory against a slow/compromised/misrouted AppSec claiming a huge
+/// body_size; exceeding it falls back to the classic block response (still 403).
+const MAX_APPSEC_RESPONSE_BODY_SIZE: usize = 256 * 1024;
+
 pub struct CrowdSecHttpContext {
     config: Config,
     ip: String,
@@ -143,16 +186,6 @@ impl CrowdSecHttpContext {
     }
 
     fn send_appsec_event(&mut self) {
-        // Truncate at the first non-printable byte so only clean text reaches AppSec
-        if let Some(pos) = self
-            .body_data
-            .iter()
-            .position(|&b| !matches!(b, 0x09 | 0x0A | 0x0D | 0x20..=0x7E))
-        {
-            log::debug!("Truncating body at non-printable byte (pos {})", pos);
-            self.body_data.truncate(pos);
-        }
-
         let body_len = self.body_data.len().to_string();
         let mut headers = vec![
             (":method", "POST"),
@@ -270,10 +303,17 @@ impl Context for CrowdSecHttpContext {
             log::info!("AppSec allows request, resuming");
             self.allow_and_resume();
         } else if status == 403 {
-            let body = if body_size > 0 {
-                self.get_http_call_response_body(0, body_size)
-            } else {
+            let body = if body_size == 0 {
                 None
+            } else if body_size > MAX_APPSEC_RESPONSE_BODY_SIZE {
+                log::error!(
+                    "AppSec response body too large ({} bytes, max {}), falling back to classic block",
+                    body_size,
+                    MAX_APPSEC_RESPONSE_BODY_SIZE
+                );
+                None
+            } else {
+                self.get_http_call_response_body(0, body_size)
             };
             let challenge = body.as_deref().and_then(parse_challenge_envelope);
 
@@ -389,8 +429,23 @@ impl HttpContext for CrowdSecHttpContext {
                 .get_http_request_header("content-type")
                 .unwrap_or_default();
 
+            if !body_is_inspectable(&self.content_type) {
+                // Binary/compressed body: skip forwarding it to AppSec entirely
+                // (headers-only check) and let it stream straight through.
+                log::info!(
+                    "Body not inspectable ({}), headers-only AppSec check",
+                    self.content_type
+                );
+                self.send_appsec_event();
+                return if self.config.crowdsec.appsec.async_mode {
+                    Action::Continue
+                } else {
+                    Action::Pause
+                };
+            }
+
             if !end_of_stream {
-                log::info!("Request has body, waiting for body data");
+                log::info!("Request has inspectable body, waiting for body data");
                 return Action::Continue;
             }
             // Body arrived with headers (end_of_stream=true): read it now
@@ -426,6 +481,12 @@ impl HttpContext for CrowdSecHttpContext {
             return Action::Continue;
         }
 
+        // Non-inspectable body: AppSec was already dispatched headers-only in
+        // on_http_request_headers; let the body stream through untouched.
+        if self.request_has_body() && !body_is_inspectable(&self.content_type) {
+            return Action::Continue;
+        }
+
         // prevent 413 when buffer is bigger that 512k
         if self.appsec_pending && body_size > 512 * 1024 {
             return Action::Continue;
@@ -444,8 +505,16 @@ impl HttpContext for CrowdSecHttpContext {
             }
         }
 
-        // Dispatch AppSec once we have enough data or stream ends
-        if self.body_data.len() >= max_size || end_of_stream {
+        // Dispatch AppSec once we have enough data or stream ends — but only once
+        // per request: skip while a call is already in flight, otherwise every
+        // later chunk that still satisfies this condition re-dispatches, causing
+        // overlapping AppSec calls that each independently resume/respond.
+        if should_dispatch_appsec(
+            self.appsec_pending,
+            self.body_data.len(),
+            max_size,
+            end_of_stream,
+        ) {
             log::info!(
                 "Dispatching AppSec: {} bytes, end_of_stream={}",
                 self.body_data.len(),
@@ -522,6 +591,64 @@ mod tests {
     #[test]
     fn test_is_trusted_ip_empty_list() {
         assert!(!is_trusted_ip("1.2.3.4", &[]));
+    }
+
+    #[test]
+    fn test_body_is_inspectable_empty_content_type() {
+        assert!(body_is_inspectable(""));
+    }
+
+    #[test]
+    fn test_body_is_inspectable_json() {
+        assert!(body_is_inspectable("application/json"));
+        assert!(body_is_inspectable("application/json; charset=utf-8"));
+    }
+
+    #[test]
+    fn test_body_is_inspectable_form_and_text() {
+        assert!(body_is_inspectable("application/x-www-form-urlencoded"));
+        assert!(body_is_inspectable("text/plain"));
+        assert!(body_is_inspectable("multipart/form-data; boundary=xyz"));
+    }
+
+    #[test]
+    fn test_body_is_inspectable_vendor_json_xml_suffix() {
+        assert!(body_is_inspectable("application/vnd.api+json"));
+        assert!(body_is_inspectable("application/atom+xml"));
+    }
+
+    #[test]
+    fn test_body_is_inspectable_binary_rejected() {
+        assert!(!body_is_inspectable("application/octet-stream"));
+        assert!(!body_is_inspectable("image/png"));
+        assert!(!body_is_inspectable("application/zip"));
+    }
+
+    #[test]
+    fn test_should_dispatch_appsec_at_size_threshold() {
+        assert!(should_dispatch_appsec(false, 100, 100, false));
+    }
+
+    #[test]
+    fn test_should_dispatch_appsec_below_threshold_mid_stream() {
+        assert!(!should_dispatch_appsec(false, 50, 100, false));
+    }
+
+    #[test]
+    fn test_should_dispatch_appsec_end_of_stream_triggers() {
+        assert!(should_dispatch_appsec(false, 10, 100, true));
+    }
+
+    #[test]
+    fn test_should_dispatch_appsec_skipped_while_pending() {
+        // Regression: a call already in flight must not be re-dispatched even
+        // though the buffer is full (this was the duplicate-dispatch bug).
+        assert!(!should_dispatch_appsec(true, 100, 100, false));
+    }
+
+    #[test]
+    fn test_should_dispatch_appsec_skipped_while_pending_at_end_of_stream() {
+        assert!(!should_dispatch_appsec(true, 100, 100, true));
     }
 
     #[test]
