@@ -2,7 +2,7 @@ services:
   crowdsec:
     image: crowdsecurity/crowdsec:latest
     environment:
-      COLLECTIONS: "crowdsecurity/appsec-generic-rules crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-crs crowdsecurity/appsec-crs-inband"
+      COLLECTIONS: "crowdsecurity/appsec-generic-rules crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-crs crowdsecurity/appsec-crs-inband crowdsecurity/appsec-bot-challenge"
       BOUNCER_KEY_envoy: "test-bouncer-key"
       DISABLE_PARSERS: "crowdsecurity/whitelists"
       APPSEC_CONFIGS: "crowdsecurity/appsec-default"
@@ -18,7 +18,7 @@ services:
       retries: 30
 
   backend:
-    image: ghcr.io/aarnaud/aarnaud/go-httpbin:v2.21.1
+    image: mccutchen/go-httpbin:latest
     environment:
       MAX_BODY_SIZE: "2147483648" # 2G
 

@@ -1,5 +1,7 @@
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::config::Config;
@@ -66,6 +68,47 @@ fn is_trusted_ip(ip: &str, trusted: &[String]) -> bool {
     trusted.iter().any(|entry| ip_in_cidr(ip, entry))
 }
 
+/// AppSec bot-detection challenge envelope: sent with HTTP 403 in place of a classic
+/// ban when the request should instead be served a proof-of-work/fingerprint challenge.
+/// See https://docs.crowdsec.net/docs/next/appsec/bot_detection/challenge_protocol
+#[derive(Deserialize)]
+struct ChallengeEnvelope {
+    action: String,
+    http_status: u16,
+    user_body_content: String,
+    #[serde(default)]
+    user_headers: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    user_cookies: Vec<String>,
+}
+
+/// Parse an AppSec 403 response body as a challenge envelope.
+/// Returns None for anything that isn't a well-formed `action: "challenge"` envelope,
+/// so callers fall back to the classic ban response.
+fn parse_challenge_envelope(body: &[u8]) -> Option<ChallengeEnvelope> {
+    let envelope: ChallengeEnvelope = serde_json::from_slice(body).ok()?;
+    if envelope.action != "challenge" {
+        return None;
+    }
+    Some(envelope)
+}
+
+/// Flatten a challenge envelope's user_headers and user_cookies into (name, value) pairs
+/// for send_http_response. Each user_headers value list becomes one header per entry;
+/// each user_cookies entry becomes one set-cookie header.
+fn build_challenge_headers(envelope: &ChallengeEnvelope) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    for (name, values) in &envelope.user_headers {
+        for value in values {
+            headers.push((name.clone(), value.clone()));
+        }
+    }
+    for cookie in &envelope.user_cookies {
+        headers.push(("set-cookie".to_string(), cookie.clone()));
+    }
+    headers
+}
+
 pub struct CrowdSecHttpContext {
     config: Config,
     ip: String,
@@ -73,6 +116,7 @@ pub struct CrowdSecHttpContext {
     method: String,
     host: String,
     user_agent: String,
+    cookie: String,
     content_type: String,
     body_data: Vec<u8>,
     appsec_pending: bool,
@@ -89,6 +133,7 @@ impl CrowdSecHttpContext {
             method: String::new(),
             host: String::new(),
             user_agent: String::new(),
+            cookie: String::new(),
             content_type: String::new(),
             body_data: Vec::new(),
             appsec_pending: false,
@@ -126,6 +171,11 @@ impl CrowdSecHttpContext {
         ];
         if !self.content_type.is_empty() && !self.body_data.is_empty() {
             headers.push(("Content-Type", self.content_type.as_str()));
+        }
+        // Forward the client's cookies untouched so AppSec can recognise a
+        // previously-solved bot-detection challenge (__crowdsec_challenge cookie).
+        if !self.cookie.is_empty() {
+            headers.push(("Cookie", self.cookie.as_str()));
         }
 
         log::info!(
@@ -220,16 +270,41 @@ impl Context for CrowdSecHttpContext {
             log::info!("AppSec allows request, resuming");
             self.allow_and_resume();
         } else if status == 403 {
-            log::warn!(
-                "AppSec blocking request from {} (status: {})",
-                self.ip,
-                status
-            );
-            self.send_http_response(
-                403,
-                vec![("content-type", "text/plain")],
-                Some(b"AppSec Access Denied"),
-            );
+            let body = if body_size > 0 {
+                self.get_http_call_response_body(0, body_size)
+            } else {
+                None
+            };
+            let challenge = body.as_deref().and_then(parse_challenge_envelope);
+
+            if let Some(challenge) = challenge {
+                log::warn!(
+                    "AppSec issuing bot-detection challenge to {} (http_status: {})",
+                    self.ip,
+                    challenge.http_status
+                );
+                let headers = build_challenge_headers(&challenge);
+                let header_refs: Vec<(&str, &str)> = headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect();
+                self.send_http_response(
+                    challenge.http_status as u32,
+                    header_refs,
+                    Some(challenge.user_body_content.as_bytes()),
+                );
+            } else {
+                log::warn!(
+                    "AppSec blocking request from {} (status: {})",
+                    self.ip,
+                    status
+                );
+                self.send_http_response(
+                    403,
+                    vec![("content-type", "text/plain")],
+                    Some(b"AppSec Access Denied"),
+                );
+            }
         } else {
             // Any other status (401 bad api key, 500, 503, etc.) is an AppSec failure
             log::error!("AppSec request failed with status: {}", status);
@@ -280,6 +355,7 @@ impl HttpContext for CrowdSecHttpContext {
         self.host = self
             .get_http_request_header(":authority")
             .unwrap_or_default();
+        self.cookie = self.get_http_request_header("cookie").unwrap_or_default();
 
         log::info!("Request: {} {} from {}", self.method, self.path, self.ip);
 
@@ -454,5 +530,88 @@ mod tests {
         assert!(is_trusted_ip("10.5.6.7", &trusted));
         assert!(is_trusted_ip("192.168.1.100", &trusted));
         assert!(!is_trusted_ip("172.16.0.1", &trusted));
+    }
+
+    #[test]
+    fn test_parse_challenge_envelope_valid() {
+        let body = br#"{
+            "action": "challenge",
+            "http_status": 200,
+            "user_body_content": "<!DOCTYPE html><html></html>",
+            "user_headers": {"Content-Type": ["text/html; charset=utf-8"]},
+            "user_cookies": ["__crowdsec_challenge=abc; Path=/; HttpOnly"]
+        }"#;
+        let envelope = parse_challenge_envelope(body).expect("should parse");
+        assert_eq!(envelope.action, "challenge");
+        assert_eq!(envelope.http_status, 200);
+        assert_eq!(envelope.user_body_content, "<!DOCTYPE html><html></html>");
+        assert_eq!(
+            envelope.user_cookies,
+            vec!["__crowdsec_challenge=abc; Path=/; HttpOnly"]
+        );
+    }
+
+    #[test]
+    fn test_parse_challenge_envelope_non_challenge_action() {
+        // Classic ban/captcha verdicts don't carry this envelope; must fall back to None.
+        let body = br#"{"action": "ban", "http_status": 403, "user_body_content": ""}"#;
+        assert!(parse_challenge_envelope(body).is_none());
+    }
+
+    #[test]
+    fn test_parse_challenge_envelope_malformed_json() {
+        assert!(parse_challenge_envelope(b"AppSec Access Denied").is_none());
+    }
+
+    #[test]
+    fn test_parse_challenge_envelope_missing_required_field() {
+        // Missing user_body_content should fail to deserialize, not panic.
+        let body = br#"{"action": "challenge", "http_status": 200}"#;
+        assert!(parse_challenge_envelope(body).is_none());
+    }
+
+    #[test]
+    fn test_build_challenge_headers_flattens_multi_value_headers() {
+        let mut user_headers = HashMap::new();
+        user_headers.insert(
+            "Content-Type".to_string(),
+            vec!["text/html; charset=utf-8".to_string()],
+        );
+        user_headers.insert(
+            "Cache-Control".to_string(),
+            vec!["no-cache".to_string(), "no-store".to_string()],
+        );
+        let envelope = ChallengeEnvelope {
+            action: "challenge".to_string(),
+            http_status: 200,
+            user_body_content: "<html></html>".to_string(),
+            user_headers,
+            user_cookies: vec!["__crowdsec_challenge=abc".to_string()],
+        };
+
+        let headers = build_challenge_headers(&envelope);
+        assert_eq!(headers.len(), 4);
+        assert!(headers.contains(&(
+            "Content-Type".to_string(),
+            "text/html; charset=utf-8".to_string()
+        )));
+        assert!(headers.contains(&("Cache-Control".to_string(), "no-cache".to_string())));
+        assert!(headers.contains(&("Cache-Control".to_string(), "no-store".to_string())));
+        assert!(headers.contains(&(
+            "set-cookie".to_string(),
+            "__crowdsec_challenge=abc".to_string()
+        )));
+    }
+
+    #[test]
+    fn test_build_challenge_headers_empty() {
+        let envelope = ChallengeEnvelope {
+            action: "challenge".to_string(),
+            http_status: 200,
+            user_body_content: String::new(),
+            user_headers: HashMap::new(),
+            user_cookies: vec![],
+        };
+        assert!(build_challenge_headers(&envelope).is_empty());
     }
 }

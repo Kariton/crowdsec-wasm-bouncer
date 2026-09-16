@@ -1,2 +1,15 @@
 plugin.wasm
 target
+
+# cscli downloads hub-managed appsec-configs (e.g. bot-detection sub-collections) into
+# this bind-mounted directory at container startup. Only the hand-authored local configs
+# below are ours; everything else is a runtime artifact and must not be hand-deleted
+# while the crowdsec container is up (it corrupts cscli's hub state, causing a
+# "tainted, use --force" fatal error on the next start).
+tests/crowdsec/appsec-configs/*
+!tests/crowdsec/appsec-configs/appsec-default.yaml
+!tests/crowdsec/appsec-configs/crs.yaml
+!tests/crowdsec/appsec-configs/default-appsec-config.yaml
+!tests/crowdsec/appsec-configs/generic-rules.yaml
+!tests/crowdsec/appsec-configs/virtual-patching.yaml
+!tests/crowdsec/appsec-configs/bot-challenge-test.yaml

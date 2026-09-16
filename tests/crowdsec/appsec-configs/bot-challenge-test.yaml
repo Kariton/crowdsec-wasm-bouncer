@@ -1,0 +1,13 @@
+name: custom/bot-challenge-test
+# Scope the bot-detection challenge to a single dedicated test path instead of using
+# crowdsecurity/appsec-bot-challenge-scoring's global "challenge every request" trigger.
+# Challenging every request would also catch this suite's own curl-based "legitimate
+# request" probes (curl can't solve the PoW, so it would get challenged too), turning
+# every 200-status assertion into a false pass against a challenge page instead of real
+# backend content. Scoping to /challenge-test keeps the rest of the suite meaningful
+# while still exercising the real challenge wire protocol end-to-end.
+inband:
+  post_eval:
+    - filter: "req.URL.Path startsWith '/challenge-test'"
+      apply:
+        - SendChallenge()

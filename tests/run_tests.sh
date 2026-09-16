@@ -32,6 +32,36 @@ assert_status() {
     fi
 }
 
+# Asserts on status code AND whether the body contains (or, with want=0, must not
+# contain) a marker string. Used to catch cases where the status code alone can't
+# tell a real backend response apart from a synthesized one (e.g. a bot-detection
+# challenge page also returns 200, same as a real passthrough response).
+assert_body() {
+    local description="$1"
+    local expected_status="$2"
+    local want="$3" # 1 = body must contain needle, 0 = body must not contain needle
+    local needle="$4"
+    shift 4
+    TOTAL=$((TOTAL + 1))
+
+    local tmp
+    tmp=$(mktemp)
+    local status
+    status=$(curl -s -o "$tmp" -w '%{http_code}' "$@" 2>/dev/null) || true
+
+    local has_needle=0
+    grep -q -- "$needle" "$tmp" && has_needle=1
+
+    if [ "$status" = "$expected_status" ] && [ "$has_needle" = "$want" ]; then
+        echo -e "${GREEN}PASS${NC} [$status] $description"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}FAIL${NC} [$status expected $expected_status, body match=$has_needle expected $want] $description"
+        FAIL=$((FAIL + 1))
+    fi
+    rm -f "$tmp"
+}
+
 echo "============================================="
 echo " CrowdSec WASM Bouncer - Integration Tests"
 echo "============================================="
@@ -244,6 +274,31 @@ else
     echo -e "${RED}FAIL${NC} [$status expected 200] $description"
     FAIL=$((FAIL + 1))
 fi
+
+echo ""
+
+# -----------------------------------------------------------
+# Bot Detection Challenge (AppSec bot_detection feature)
+# -----------------------------------------------------------
+# tests/crowdsec/appsec-configs/bot-challenge-test.yaml scopes the challenge trigger
+# to /challenge-test only, so it can't interfere with the 200/403 assertions above
+# (curl can never solve the PoW, so a globally-applied challenge would silently turn
+# every "legitimate 200" case above into a 200-status challenge page instead of real
+# backend content).
+echo -e "${YELLOW}=== Bot Detection Challenge ===${NC}"
+echo ""
+
+assert_body "Challenge issued on scoped test path" 200 1 "CrowdSec Challenge" \
+    "$ENVOY_URL/challenge-test"
+
+assert_body "Normal path unaffected by bot detection (regression guard)" 200 0 "CrowdSec Challenge" \
+    "$ENVOY_URL/get"
+
+assert_status "Internal endpoint fpscanner.js reachable" 200 \
+    "$ENVOY_URL/crowdsec-internal/challenge/fpscanner.js"
+
+assert_status "Internal endpoint pow-worker.js reachable" 200 \
+    "$ENVOY_URL/crowdsec-internal/challenge/pow-worker.js"
 
 echo ""
 
