@@ -150,7 +150,7 @@ fn build_challenge_headers(envelope: &ChallengeEnvelope) -> Vec<(String, String)
 /// Hard cap on the AppSec 403-response body (challenge/ban envelope) read per call.
 /// Bounds memory against a slow/compromised/misrouted AppSec claiming a huge
 /// body_size; exceeding it falls back to the classic block response (still 403).
-const MAX_APPSEC_RESPONSE_BODY_SIZE: usize = 256 * 1024;
+const MAX_APPSEC_RESPONSE_BODY_SIZE: usize = 384 * 1024;
 
 pub struct CrowdSecHttpContext {
     config: Config,
